@@ -2,8 +2,9 @@ package com.ngefilm
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.utils.getQualityFromName
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
 
 /**
@@ -79,26 +80,24 @@ class NgefilmProvider : MainAPI() {
             ?: doc.selectFirst(".site-content")
             ?: doc
 
-        // Poster
         val poster = page.selectFirst("img.wp-post-image, img[src*='ngefilm'], img[src]")?.attr("src") ?: ""
 
-        // Judul
         val title = page.selectFirst("h1.entry-title")?.text()
             ?: page.selectFirst("title")?.text()?.substringBefore(" -")?.trim()
             ?: return null
 
-        // Metadata
         val year = page.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
-        val qualityStr = page.selectFirst("a[href*='/quality/']")?.text()
         val genres = page.select("a[href*='/Genre/']").mapNotNull { it.text().trim().ifEmpty { null } }
         val tags = page.select("a[href*='/tag/']").mapNotNull { it.text().trim().ifEmpty { null } }
         val cast = page.select("a[href*='/cast/']").mapNotNull { it.text().trim().ifEmpty { null } }
-        val ratingElem = page.selectFirst(".gmr-rating-content")
-        val rating = ratingElem?.text()?.trim()?.toRatingInt()
         val plot = page.selectFirst(".entry-content.entry-content-single")?.text()
             ?: page.selectFirst(".entry-content")?.text() ?: ""
-        val duration = page.selectFirst(".gmr-duration-item")?.text()
+
+        // Duration: parse menit dari teks
+        val durationText = page.selectFirst(".gmr-duration-item")?.text()
             ?: page.selectFirst("span[class*='duration']")?.text()
+        val duration = Regex("""(\d+)""").find(durationText ?: "")?.groupValues?.get(1)?.toIntOrNull()
+
         val trailer = page.selectFirst("a.gmr-trailer-popup")?.attr("href")
 
         val allTags = genres + tags.filter { it !in genres }
@@ -106,9 +105,9 @@ class NgefilmProvider : MainAPI() {
         val isTvSeries = url.contains("/tv/") || url.contains("-season-")
 
         return if (isTvSeries) {
-            loadTvSeries(url, page, title, poster, year, qualityStr, allTags, cast, plot, duration, trailer, rating)
+            loadTvSeries(url, page, title, poster, year, allTags, cast, plot, duration, trailer)
         } else {
-            loadMovie(url, page, title, poster, year, qualityStr, allTags, cast, plot, duration, trailer, rating)
+            loadMovie(url, page, title, poster, year, allTags, cast, plot, duration, trailer)
         }
     }
 
@@ -122,35 +121,29 @@ class NgefilmProvider : MainAPI() {
         title: String,
         poster: String,
         year: Int?,
-        qualityStr: String?,
         tags: List<String>,
         cast: List<String>,
         plot: String,
-        duration: String?,
-        trailer: String?,
-        rating: Int?
+        duration: Int?,
+        trailer: String?
     ): LoadResponse {
-        // Kumpulkan semua source dari server tabs
         val sources = mutableListOf<String>()
 
-        // Server tabs: Server 1, Server 2, Server 3, Server 4
+        // Server tabs: Server 1 — Server 4
         val serverTabs = page.select(".muvipro-player-tabs a")
         if (serverTabs.isNotEmpty()) {
             serverTabs.forEach { tab ->
                 val playerUrl = tab.attr("href")
                 val serverName = tab.text().trim()
                 if (playerUrl.isNotBlank() && serverName.isNotBlank()) {
-                    val watchUrl = if (playerUrl.startsWith("?")) {
-                        "$url$playerUrl"
-                    } else {
-                        fixUrl(playerUrl)
-                    }
-                    sources.add(watchUrl)
+                    sources.add(
+                        if (playerUrl.startsWith("?")) "$url$playerUrl" else fixUrl(playerUrl)
+                    )
                 }
             }
         }
 
-        // Fallback 1: iframe langsung
+        // Fallback: iframe
         if (sources.isEmpty()) {
             val iframe = page.selectFirst(".gmr-embed-responsive iframe")
             val iframeSrc = iframe?.attr("data-litespeed-src")
@@ -160,21 +153,17 @@ class NgefilmProvider : MainAPI() {
             }
         }
 
-        // Fallback 2: URL halaman itu sendiri
-        if (sources.isEmpty()) {
-            sources.add(url)
-        }
+        // Fallback: halaman itu sendiri
+        if (sources.isEmpty()) sources.add(url)
 
         return newMovieLoadResponse(title, url, TvType.Movie, sources) {
             this.posterUrl = poster
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.quality = parseQuality(qualityStr)
-            addDuration(duration)
-            addActors(cast)
-            this.rating = rating
-            addTrailer(trailer)
+            this.duration = duration
+            this.actors = cast.map { ActorData(Actor(it, "")) }
+            // trailer tidak ditambahkan karena API baru tidak mendukung addTrailer
         }
     }
 
@@ -188,13 +177,11 @@ class NgefilmProvider : MainAPI() {
         title: String,
         poster: String,
         year: Int?,
-        qualityStr: String?,
         tags: List<String>,
         cast: List<String>,
         plot: String,
-        duration: String?,
-        trailer: String?,
-        rating: Int?
+        duration: Int?,
+        trailer: String?
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
         val seasonNum = Regex("""-season-(\d+)""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
@@ -232,7 +219,7 @@ class NgefilmProvider : MainAPI() {
             } catch (_: Exception) { }
         }
 
-        // Strategi 2: Link episode di halaman
+        // Strategi 2: Link di halaman
         if (episodes.isEmpty()) {
             page.select("a[href*='/episode/'], a[href*='/tv/']").forEachIndexed { index, el ->
                 val epUrl = el.attr("href")
@@ -268,16 +255,13 @@ class NgefilmProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.quality = parseQuality(qualityStr)
-            addDuration(duration)
-            addActors(cast)
-            this.rating = rating
-            addTrailer(trailer)
+            this.duration = duration
+            this.actors = cast.map { ActorData(Actor(it, "")) }
         }
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  LOAD LINKS — Ambil Video dari Iframe/Player
+    //  LOAD LINKS — Video dari Iframe/Player
     // ═══════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
@@ -287,13 +271,11 @@ class NgefilmProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var found = false
-
         val targetUrl = if (data.startsWith("?")) fixUrl(data) else data
-
         val doc = app.get(targetUrl, referer = mainUrl).document
 
-        // Strategi 1: Iframe player
-        found = tryExtractIframe(doc, targetUrl, subtitleCallback, callback) || found
+        // Strategi 1: Iframe
+        found = tryExtractIframe(doc, subtitleCallback, callback) || found
 
         // Strategi 2: Server tabs
         if (!found) {
@@ -302,39 +284,32 @@ class NgefilmProvider : MainAPI() {
                 val href = tab.attr("href")
                 if (href.startsWith("?player=")) {
                     try {
-                        val tabDoc = app.get("${mainUrl}$href", referer = targetUrl).document
-                        found = tryExtractIframe(tabDoc, "$mainUrl$href", subtitleCallback, callback) || found
+                        val tabDoc = app.get("$mainUrl$href", referer = targetUrl).document
+                        found = tryExtractIframe(tabDoc, subtitleCallback, callback) || found
                     } catch (_: Exception) { }
                     if (found) break
                 }
             }
         }
 
-        // Strategi 3: AJAX
-        if (!found) {
-            found = tryExtractAjax(doc, targetUrl, subtitleCallback, callback) || found
-        }
+        // Strategi 3: AJAX admin-ajax
+        if (!found) found = tryExtractAjax(doc, subtitleCallback, callback) || found
 
         // Strategi 4: Script tags
-        if (!found) {
-            found = tryExtractFromScripts(doc, subtitleCallback, callback) || found
-        }
+        if (!found) found = tryExtractFromScripts(doc, subtitleCallback, callback) || found
 
-        // Strategi 5: Fallback
-        if (!found) {
-            found = loadExtractor(targetUrl, subtitleCallback, callback)
-        }
+        // Strategi 5: Fallback URL langsung
+        if (!found) found = loadExtractor(targetUrl, subtitleCallback, callback)
 
         return found
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  EKSTRAKTOR HELPER
+    //  EKSTRAKTOR
     // ═══════════════════════════════════════════════════════════════
 
     private suspend fun tryExtractIframe(
         doc: Element,
-        referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -342,22 +317,17 @@ class NgefilmProvider : MainAPI() {
             .filter { it.attr("src") != "about:blank" || it.hasAttr("data-litespeed-src") }
 
         for (iframe in iframes) {
-            var src = iframe.attr("data-litespeed-src")
+            val src = iframe.attr("data-litespeed-src")
                 .ifEmpty { iframe.attr("src") }
                 .ifEmpty { continue }
-
             if (src == "about:blank" || src.length < 10) continue
-
-            if (loadExtractor(fixUrl(src), subtitleCallback, callback)) {
-                return true
-            }
+            if (loadExtractor(fixUrl(src), subtitleCallback, callback)) return true
         }
         return false
     }
 
     private suspend fun tryExtractAjax(
         doc: Element,
-        referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -369,11 +339,8 @@ class NgefilmProvider : MainAPI() {
             try {
                 val response = app.post(
                     "$mainUrl/wp-admin/admin-ajax.php",
-                    data = mapOf(
-                        "action" to "muvipro_get_player",
-                        "id" to id
-                    ),
-                    referer = referer
+                    data = mapOf("action" to "muvipro_get_player", "id" to id),
+                    referer = mainUrl
                 ).text
 
                 val iframeSrc = Regex("""src=["']([^"']+)["']""").find(response)?.groupValues?.get(1)
@@ -383,16 +350,10 @@ class NgefilmProvider : MainAPI() {
 
                 val directUrl = Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""").find(response)?.groupValues?.get(1)
                 if (!directUrl.isNullOrBlank()) {
-                    callback(
-                        ExtractorLink(
-                            name,
-                            name,
-                            directUrl,
-                            referer,
-                            getQualityFromName(""),
-                            directUrl.contains(".m3u8")
-                        )
-                    )
+                    callback(newExtractorLink(name, name, directUrl) {
+                        referer = mainUrl
+                        quality = if (directUrl.contains(".m3u8")) Qualities.Unknown.value else Qualities.Unknown.value
+                    })
                     return true
                 }
             } catch (_: Exception) { }
@@ -417,18 +378,14 @@ class NgefilmProvider : MainAPI() {
             )
 
             for (pattern in patterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    val videoUrl = match.groupValues[1]
-                    if (videoUrl.contains("http") &&
-                        !videoUrl.contains("google.com") &&
-                        !videoUrl.contains("recaptcha") &&
-                        !videoUrl.contains("facebook.com")
-                    ) {
-                        if (loadExtractor(fixUrl(videoUrl), subtitleCallback, callback)) {
-                            return true
-                        }
-                    }
+                val match = pattern.find(html) ?: continue
+                val videoUrl = match.groupValues[1]
+                if (videoUrl.contains("http") &&
+                    !videoUrl.contains("google.com") &&
+                    !videoUrl.contains("recaptcha") &&
+                    !videoUrl.contains("facebook.com")
+                ) {
+                    if (loadExtractor(fixUrl(videoUrl), subtitleCallback, callback)) return true
                 }
             }
         }
@@ -439,30 +396,27 @@ class NgefilmProvider : MainAPI() {
     //  HELPERS
     // ═══════════════════════════════════════════════════════════════
 
-    private val qualityMap = mapOf(
-        "BluRay" to SearchQuality.BLURAY,
-        "WEB-DL" to SearchQuality.WEB_DL,
-        "WEBRip" to SearchQuality.WEB_DL,
-        "HDRip" to SearchQuality.HDRIP,
-        "HD" to SearchQuality.HD,
-        "HDTS" to SearchQuality.HD,
-        "CAM" to SearchQuality.CAM,
-        "DVD" to SearchQuality.DVD,
-        "DVDSCR" to SearchQuality.DVD,
-        "4K" to SearchQuality.FOUR_K,
-        "1080p" to SearchQuality.FHD,
-        "720p" to SearchQuality.HD,
-        "480p" to SearchQuality.SD,
-        "360p" to SearchQuality.SD,
-    )
-
-    private fun parseQuality(value: String?): SearchQuality? {
-        if (value == null) return null
-        return qualityMap.entries.firstOrNull { (key, _) ->
-            value.contains(key, ignoreCase = true)
-        }?.value ?: getQualityFromName(value)
+    /**
+     * Mapping kualitas (String) → Qualities (Int)
+     */
+    private fun parseQuality(value: String?): Int {
+        if (value == null) return Qualities.Unknown.value
+        return when {
+            value.contains("4K", ignoreCase = true) -> Qualities.P2160.value
+            value.contains("1080", ignoreCase = true) -> Qualities.P1080.value
+            value.contains("720", ignoreCase = true) ||
+                value.contains("HD", ignoreCase = true) -> Qualities.P720.value
+            value.contains("480", ignoreCase = true) ||
+                value.contains("DVD", ignoreCase = true) -> Qualities.P480.value
+            value.contains("360", ignoreCase = true) -> Qualities.P360.value
+            value.contains("CAM", ignoreCase = true) -> Qualities.P360.value
+            else -> Qualities.Unknown.value
+        }
     }
 
+    /**
+     * Konversi elemen HTML artikel (grid) → SearchResponse
+     */
     private fun Element.toSearchResult(provider: NgefilmProvider): SearchResponse? {
         val linkEl = this.selectFirst("a[href]") ?: return null
         val href = fixUrl(linkEl.attr("href"))
@@ -483,25 +437,16 @@ class NgefilmProvider : MainAPI() {
         val isTvSeries = href.contains("/tv/") || this.`is`("article[class*='tv']")
 
         return if (isTvSeries) {
-            TvSeriesSearchResponse(
-                title,
-                href,
-                provider.name,
-                TvType.TvSeries,
-                posterUrl,
-                year = year,
-                quality = quality
-            )
+            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.quality = quality
+            }
         } else {
-            MovieSearchResponse(
-                title,
-                href,
-                provider.name,
-                TvType.Movie,
-                posterUrl,
-                year = year,
-                quality = quality
-            )
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+                this.year = year
+                this.quality = quality
+            }
         }
     }
-}
