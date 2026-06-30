@@ -17,7 +17,6 @@ class NgefilmProvider : MainAPI() {
     override var mainUrl = "https://new37.ngefilm.site"
     override var name = "Ngefilm21"
     override var lang = "id"
-
     override val hasMainPage = true
     override val hasQuickSearch = false
     override val hasChromecastSupport = true
@@ -30,10 +29,10 @@ class NgefilmProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        Pair("1", "Film Terbaru"),
-        Pair("2", "Series Terbaru"),
-        Pair("3", "Drama Korea"),
-        Pair("4", "Trending"),
+        "1" to "Film Terbaru",
+        "2" to "Series Terbaru",
+        "3" to "Drama Korea",
+        "4" to "Trending",
     )
 
     override suspend fun getMainPage(
@@ -45,14 +44,18 @@ class NgefilmProvider : MainAPI() {
 
         val items = doc.select("article").mapNotNull { it.toSearchResult(this) }
 
-        return newHomePageResponse(request.name, items)
+        return newHomePageResponse(
+            listOf(
+                HomePageList(request.name, items, true)
+            )
+        )
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  SEARCH
     // ═══════════════════════════════════════════════════════════════
 
-    override suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String, page: Int): SearchResponseList? {
         val doc = app.get(
             "$mainUrl/",
             params = mapOf(
@@ -62,31 +65,31 @@ class NgefilmProvider : MainAPI() {
             )
         ).document
 
-        return doc.select("article").mapNotNull { it.toSearchResult(this) }
+        val results = doc.select("article").mapNotNull { it.toSearchResult(this) }
+        return results.toNewSearchResponseList()
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  LOAD — Detail Film / Series
     // ═══════════════════════════════════════════════════════════════
 
-    override suspend fun load(url: String): LoadResponse {
+    override suspend fun load(url: String): LoadResponse? {
         val doc = app.get(url).document
         val page = doc.selectFirst(".gmr-box-content.gmr-single")
             ?: doc.selectFirst(".site-content")
             ?: doc
 
         // Poster
-        val poster = page.selectFirst("img[src*='ngefilm'], img.wp-post-image, img[src]")?.attr("src") ?: ""
+        val poster = page.selectFirst("img.wp-post-image, img[src*='ngefilm'], img[src]")?.attr("src") ?: ""
 
         // Judul
         val title = page.selectFirst("h1.entry-title")?.text()
             ?: page.selectFirst("title")?.text()?.substringBefore(" -")?.trim()
-            ?: throw ErrorLoadingException("Tidak dapat menemukan judul film")
+            ?: return null
 
         // Metadata
         val year = page.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
         val qualityStr = page.selectFirst("a[href*='/quality/']")?.text()
-        val country = page.selectFirst("a[href*='/country/']")?.text()
         val genres = page.select("a[href*='/Genre/']").mapNotNull { it.text().trim().ifEmpty { null } }
         val tags = page.select("a[href*='/tag/']").mapNotNull { it.text().trim().ifEmpty { null } }
         val cast = page.select("a[href*='/cast/']").mapNotNull { it.text().trim().ifEmpty { null } }
@@ -98,42 +101,14 @@ class NgefilmProvider : MainAPI() {
             ?: page.selectFirst("span[class*='duration']")?.text()
         val trailer = page.selectFirst("a.gmr-trailer-popup")?.attr("href")
 
-        // Tipe
-        val isTvSeries = url.contains("/tv/") || url.contains("-season-")
-
-        // Kumpulkan semua tags
         val allTags = genres + tags.filter { it !in genres }
 
-        if (isTvSeries) {
-            return loadTvSeries(
-                url = url,
-                page = page,
-                title = title,
-                poster = poster,
-                year = year,
-                quality = qualityStr,
-                tags = allTags,
-                cast = cast,
-                plot = plot,
-                duration = duration,
-                trailer = trailer,
-                rating = rating
-            )
+        val isTvSeries = url.contains("/tv/") || url.contains("-season-")
+
+        return if (isTvSeries) {
+            loadTvSeries(url, page, title, poster, year, qualityStr, allTags, cast, plot, duration, trailer, rating)
         } else {
-            return loadMovie(
-                url = url,
-                page = page,
-                title = title,
-                poster = poster,
-                year = year,
-                quality = qualityStr,
-                tags = allTags,
-                cast = cast,
-                plot = plot,
-                duration = duration,
-                trailer = trailer,
-                rating = rating
-            )
+            loadMovie(url, page, title, poster, year, qualityStr, allTags, cast, plot, duration, trailer, rating)
         }
     }
 
@@ -147,7 +122,7 @@ class NgefilmProvider : MainAPI() {
         title: String,
         poster: String,
         year: Int?,
-        quality: String?,
+        qualityStr: String?,
         tags: List<String>,
         cast: List<String>,
         plot: String,
@@ -195,7 +170,7 @@ class NgefilmProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.quality = parseQuality(quality)
+            this.quality = parseQuality(qualityStr)
             addDuration(duration)
             addActors(cast)
             this.rating = rating
@@ -213,7 +188,7 @@ class NgefilmProvider : MainAPI() {
         title: String,
         poster: String,
         year: Int?,
-        quality: String?,
+        qualityStr: String?,
         tags: List<String>,
         cast: List<String>,
         plot: String,
@@ -222,21 +197,16 @@ class NgefilmProvider : MainAPI() {
         rating: Int?
     ): LoadResponse {
         val episodes = mutableListOf<Episode>()
-
-        // Parse season dari URL
         val seasonNum = Regex("""-season-(\d+)""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
 
-        // Strategi 1: Cari daftar episode dari AJAX endpoint Muvipro
-        // Coba ambil data-post-id atau ID dari halaman
+        // Strategi 1: AJAX Muvipro
         val postId = page.selectFirst("article")?.attr("id")?.removePrefix("post-")
             ?: page.selectFirst("[data-post-id]")?.attr("data-post-id")
 
         if (postId != null) {
-            // Muvipro/GMV biasanya punya AJAX untuk load episode
             try {
-                val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
                 val epResponse = app.post(
-                    ajaxUrl,
+                    "$mainUrl/wp-admin/admin-ajax.php",
                     data = mapOf(
                         "action" to "muvipro_get_episode",
                         "post_id" to postId,
@@ -245,52 +215,44 @@ class NgefilmProvider : MainAPI() {
                     referer = url
                 ).document
 
-                val episodeItems = epResponse.select("a[href]")
-                if (episodeItems.isNotEmpty()) {
-                    episodeItems.forEachIndexed { index, el ->
-                        val epUrl = fixUrl(el.attr("href"))
-                        val epTitle = el.text().trim().ifEmpty { "Episode ${index + 1}" }
-                        val epNum = Regex("""(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
-                            ?: (index + 1)
+                epResponse.select("a[href]").forEachIndexed { index, el ->
+                    val epUrl = fixUrl(el.attr("href"))
+                    val epTitle = el.text().trim().ifEmpty { "Episode ${index + 1}" }
+                    val epNum = Regex("""(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: (index + 1)
 
-                        episodes.add(
-                            newEpisode(epUrl) {
-                                this.name = epTitle
-                                this.episode = epNum
-                                this.season = seasonNum
-                            }
-                        )
-                    }
+                    episodes.add(
+                        newEpisode(epUrl) {
+                            this.name = epTitle
+                            this.episode = epNum
+                            this.season = seasonNum
+                        }
+                    )
                 }
-            } catch (_: Exception) {
-                // Silent — fallback ke strategi berikutnya
-            }
+            } catch (_: Exception) { }
         }
 
-        // Strategi 2: Cari dari halaman (link bertanda episode)
+        // Strategi 2: Link episode di halaman
         if (episodes.isEmpty()) {
-            val episodeLinks = page.select("a[href*='/episode/'], a[href*='/tv/']")
-            if (episodeLinks.isNotEmpty()) {
-                episodeLinks.forEachIndexed { index, el ->
-                    val epUrl = el.attr("href")
-                    if (epUrl.isNotBlank() && !epUrl.contains("#") && !epUrl.startsWith("javascript")) {
-                        val epTitle = el.text().trim()
-                        val epNum = Regex("""(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
-                            ?: (index + 1)
+            page.select("a[href*='/episode/'], a[href*='/tv/']").forEachIndexed { index, el ->
+                val epUrl = el.attr("href")
+                if (epUrl.isNotBlank() && !epUrl.contains("#") && !epUrl.startsWith("javascript")) {
+                    val epTitle = el.text().trim()
+                    val epNum = Regex("""(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: (index + 1)
 
-                        episodes.add(
-                            newEpisode(fixUrl(epUrl)) {
-                                this.name = epTitle.ifEmpty { "Episode $epNum" }
-                                this.episode = epNum
-                                this.season = seasonNum
-                            }
-                        )
-                    }
+                    episodes.add(
+                        newEpisode(fixUrl(epUrl)) {
+                            this.name = epTitle.ifEmpty { "Episode $epNum" }
+                            this.episode = epNum
+                            this.season = seasonNum
+                        }
+                    )
                 }
             }
         }
 
-        // Strategi 3: Fallback — satu entry per season
+        // Strategi 3: Fallback
         if (episodes.isEmpty()) {
             episodes.add(
                 newEpisode(url) {
@@ -306,7 +268,7 @@ class NgefilmProvider : MainAPI() {
             this.year = year
             this.plot = plot
             this.tags = tags
-            this.quality = parseQuality(quality)
+            this.quality = parseQuality(qualityStr)
             addDuration(duration)
             addActors(cast)
             this.rating = rating
@@ -326,47 +288,41 @@ class NgefilmProvider : MainAPI() {
     ): Boolean {
         var found = false
 
-        // Tentukan target URL
-        val targetUrl = if (data.startsWith("?")) {
-            fixUrl(data)
-        } else {
-            data
-        }
+        val targetUrl = if (data.startsWith("?")) fixUrl(data) else data
 
         val doc = app.get(targetUrl, referer = mainUrl).document
 
-        // ── Strategi 1: Iframe player ──
+        // Strategi 1: Iframe player
         found = tryExtractIframe(doc, targetUrl, subtitleCallback, callback) || found
 
-        // ── Strategi 2: Server tabs — load dari ?player=N ──
+        // Strategi 2: Server tabs
         if (!found) {
             val serverTabs = doc.select(".muvipro-player-tabs a")
             for (tab in serverTabs) {
                 val href = tab.attr("href")
                 if (href.startsWith("?player=")) {
-                    val tabUrl = "${mainUrl}$href"
                     try {
-                        val tabDoc = app.get(tabUrl, referer = targetUrl).document
-                        found = tryExtractIframe(tabDoc, tabUrl, subtitleCallback, callback) || found
+                        val tabDoc = app.get("${mainUrl}$href", referer = targetUrl).document
+                        found = tryExtractIframe(tabDoc, "$mainUrl$href", subtitleCallback, callback) || found
                     } catch (_: Exception) { }
                     if (found) break
                 }
             }
         }
 
-        // ── Strategi 3: AJAX admin-ajax.php ──
+        // Strategi 3: AJAX
         if (!found) {
             found = tryExtractAjax(doc, targetUrl, subtitleCallback, callback) || found
         }
 
-        // ── Strategi 4: Cari di script tags ──
+        // Strategi 4: Script tags
         if (!found) {
             found = tryExtractFromScripts(doc, subtitleCallback, callback) || found
         }
 
-        // ── Strategi 5: Fallback — langsung ekstrak URL ──
+        // Strategi 5: Fallback
         if (!found) {
-            found = loadExtractor(targetUrl, mainUrl, subtitleCallback, callback)
+            found = loadExtractor(targetUrl, subtitleCallback, callback)
         }
 
         return found
@@ -376,47 +332,35 @@ class NgefilmProvider : MainAPI() {
     //  EKSTRAKTOR HELPER
     // ═══════════════════════════════════════════════════════════════
 
-    /**
-     * Cari dan ekstrak dari iframe player (.gmr-embed-responsive iframe)
-     */
     private suspend fun tryExtractIframe(
         doc: Element,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Cari semua iframe yang relevan
         val iframes = doc.select("iframe")
             .filter { it.attr("src") != "about:blank" || it.hasAttr("data-litespeed-src") }
 
         for (iframe in iframes) {
-            // data-litespeed-src adalah lazy load. Setelah klik tombol #timeloading,
-            // src akan diisi dari atribut ini.
             var src = iframe.attr("data-litespeed-src")
                 .ifEmpty { iframe.attr("src") }
                 .ifEmpty { continue }
 
-            if (src == "about:blank") continue
-            if (src.length < 10) continue // filter src pendek/ga valid
+            if (src == "about:blank" || src.length < 10) continue
 
-            val finalUrl = fixUrl(src)
-            if (loadExtractor(finalUrl, referer, subtitleCallback, callback)) {
+            if (loadExtractor(fixUrl(src), subtitleCallback, callback)) {
                 return true
             }
         }
         return false
     }
 
-    /**
-     * Coba AJAX endpoint WordPress (action: muvipro_get_player)
-     */
     private suspend fun tryExtractAjax(
         doc: Element,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Cari data-id atau data-linkid dari elemen player
         val playerData = doc.select("[data-id], [data-linkid]")
         for (el in playerData) {
             val id = el.attr("data-id").ifEmpty { el.attr("data-linkid") }
@@ -432,15 +376,11 @@ class NgefilmProvider : MainAPI() {
                     referer = referer
                 ).text
 
-                // Cari src iframe di response
                 val iframeSrc = Regex("""src=["']([^"']+)["']""").find(response)?.groupValues?.get(1)
-                if (!iframeSrc.isNullOrBlank()) {
-                    if (loadExtractor(fixUrl(iframeSrc), referer, subtitleCallback, callback)) {
-                        return true
-                    }
+                if (!iframeSrc.isNullOrBlank() && loadExtractor(fixUrl(iframeSrc), subtitleCallback, callback)) {
+                    return true
                 }
 
-                // Cari URL langsung
                 val directUrl = Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""").find(response)?.groupValues?.get(1)
                 if (!directUrl.isNullOrBlank()) {
                     callback(
@@ -460,9 +400,6 @@ class NgefilmProvider : MainAPI() {
         return false
     }
 
-    /**
-     * Cari URL player di dalam script tags
-     */
     private suspend fun tryExtractFromScripts(
         doc: Element,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -473,7 +410,6 @@ class NgefilmProvider : MainAPI() {
             val html = script.html()
             if (html.isBlank()) continue
 
-            // Cari pola URL player/embed
             val patterns = listOf(
                 Regex("""(?:url|src|player|embed|file)\s*[:=]\s*["']([^"']+)["']"""),
                 Regex("""(https?://[^"'\s]+player[^"'\s]*)"""),
@@ -489,7 +425,7 @@ class NgefilmProvider : MainAPI() {
                         !videoUrl.contains("recaptcha") &&
                         !videoUrl.contains("facebook.com")
                     ) {
-                        if (loadExtractor(fixUrl(videoUrl), mainUrl, subtitleCallback, callback)) {
+                        if (loadExtractor(fixUrl(videoUrl), subtitleCallback, callback)) {
                             return true
                         }
                     }
@@ -527,9 +463,6 @@ class NgefilmProvider : MainAPI() {
         }?.value ?: getQualityFromName(value)
     }
 
-    /**
-     * Konversi elemen HTML artikel (di grid) menjadi SearchResponse
-     */
     private fun Element.toSearchResult(provider: NgefilmProvider): SearchResponse? {
         val linkEl = this.selectFirst("a[href]") ?: return null
         val href = fixUrl(linkEl.attr("href"))
